@@ -20,7 +20,7 @@ func main() {
 		return
 	}
 	stdinReader := bufio.NewReader(os.Stdin)
-	conn_reader := bufio.NewReader(conn)
+	connReader := bufio.NewReader(conn)
 	timeout := 0
 	nowFormatted := time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
 	fmt.Printf("1:M %s # Server initialized\n", nowFormatted)
@@ -41,15 +41,30 @@ func main() {
 			}
 			continue
 		}
-		cmd_tab := strings.Fields(cmd)
-		if len(cmd_tab) == 0 {
+		quotedCmd:=""
+		quoted:=0
+		for i:=0; i<len(cmd); i++{
+		if cmd[i] == '"' {
+			quoted++
+			if quoted == 2 { break }
+			continue
+			}
+			if quoted == 1 {
+				quotedCmd += string(cmd[i])
+			}
+		}
+		cmdTab := strings.Fields(cmd)
+		if quoted == 2{
+			cmdTab = []string {cmdTab[0],cmdTab[1],quotedCmd}
+		}
+		if len(cmdTab) == 0 {
 			continue
 		}
-		if strings.ToUpper(cmd_tab[0]) == "Q" {
+		if strings.ToUpper(cmdTab[0]) == "Q" {
 			conn.Close()
 			return
 		}
-		if strings.ToUpper(cmd_tab[0]) == "CLEAR" {
+		if strings.ToUpper(cmdTab[0]) == "CLEAR" {
 			cmd := exec.Command("clear")
 			cmd.Stdout = os.Stdout
 			if err := cmd.Run(); err != nil {
@@ -57,12 +72,12 @@ func main() {
    			 }
 			 continue
 		}
-		conn.Write(resp.EncodeCommand(cmd_tab))
+		conn.Write(resp.EncodeCommand(cmdTab))
 		stop := 0
-		count := 0
+		count := 1
 		for {
-			response, err := conn_reader.ReadString('\n')
-			stop++
+			conn.SetReadDeadline(time.Now().Add(time.Minute))
+			response, err := connReader.ReadString('\n')
 			if err != nil {
 				fmt.Println(err)
 				if err == io.EOF {
@@ -71,33 +86,37 @@ func main() {
 					return
 				}
 				timeout++
-				if timeout == 1000{
+				if timeout == 100{
 				break
 			}
 				continue
 			}
-			fmt.Println(response)
+			if !(response[0] == '+' || response[0] == '-' || response[0] == ':' || response[0] == '$' || response[0] == '*'){
+				fmt.Print("-ERR unknown response\r\n")
+				break
+			}
+			stop++
 			timeout = 0
 			if response[0] == '+' || response[0] == '-' || response[0] == ':' || strings.HasPrefix(response, "$-1") || strings.HasPrefix(response, "*-1") {
+				fmt.Print(response)
 				break
 			}
-			strVal := strings.TrimSpace(response[1:])
 			if response[0] == '*' {
+				strVal := strings.TrimSpace(response[1:])
 				num, err := strconv.Atoi(strVal)
 				if err != nil {
-					fmt.Println(err)
+					fmt.Print(err)
 					break
 				}
-				count = num + 1
+				count += num  
 			}
 
-			if response[0] == '$' && stop == 1 {
-				valLine, err := conn_reader.ReadString('\n')
+			if response[0] == '$'{
+				valLine, err := connReader.ReadString('\n')
 				if err != nil {
 					break
 				}
-				fmt.Print(valLine)
-				break
+				fmt.Printf("\"%s\" \n",strings.TrimSuffix(valLine,"\r\n"))
 			}
 
 			if count == stop {
