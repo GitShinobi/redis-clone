@@ -17,10 +17,18 @@ func EncodeCommand(cmds []string) []byte {
 	return response
 }
 
-func ErrorMsg(size int, num int, msg string)([]byte){
-	var response []byte
- 	if num !=  size {
-		response = []byte(msg)  
+func ErrorMsg(size int, num int, cmd string, op string)([]byte){
+	var valid bool
+	switch op {
+	case "==":
+		valid = size == num
+	case ">=":
+		valid = size >= num
+	default:
+		return []byte(fmt.Sprintf("-ERR internal error: invalid operator '%s' for command '%s'\r\n", op, cmd))	}
+ 	  if !valid {
+		strResponse := fmt.Sprintf("ERR wrong number of arguments for '%s' command\r\n",cmd)
+		return []byte(strResponse)  
 	}
-	return response
+	return nil
 }
