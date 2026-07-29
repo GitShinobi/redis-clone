@@ -27,7 +27,7 @@ func ErrorMsg(size int, num int, cmd string, op string)([]byte){
 	default:
 		return []byte(fmt.Sprintf("-ERR internal error: invalid operator '%s' for command '%s'\r\n", op, cmd))	}
  	  if !valid {
-		strResponse := fmt.Sprintf("ERR wrong number of arguments for '%s' command\r\n",cmd)
+		strResponse := fmt.Sprintf("-ERR wrong number of arguments for '%s' command\r\n",cmd)
 		return []byte(strResponse)  
 	}
 	return nil

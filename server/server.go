@@ -129,7 +129,6 @@ func readCommand(reader *bufio.Reader) ([]string, error) {
 	}
 	nbrCmd, err := strconv.Atoi(GetCmdSize(line))
 	if err != nil {
-		fmt.Println("failed conversion : ", err)
 		fmt.Println(err)
 		return nil, err
 	}
@@ -378,26 +377,26 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 				if data.kind != "list"{
 				return []byte("-ERR value not a list\r\n")}
 				if strings.ToUpper(cmds[0])[0] == 'L'{
-						slices.Reverse(newValues)
+						slices.Reverse(newValues)   
 						*(data.listVal) = append(newValues,*data.listVal...)
 				}else {
 						*(data.listVal) = append(*data.listVal,newValues...)}
-				strResponse = fmt.Sprintf(":%d\r\n",len(*(data.listVal)))
+		
 		} else {
 			if strings.ToUpper(cmds[0])[0] == 'L'{
 				slices.Reverse(newValues)
 			}
 			data = entry{"list",nil,&newValues,nil, time.Time{}}
 			shards[index][key] = data
-			strResponse = fmt.Sprintf(":%d\r\n",len(*(data.listVal)))
 		}
+		strResponse = fmt.Sprintf(":%d\r\n", len(*(data.listVal)))
+		shards[index][key] = data
 		cmdBufMu.Lock()
 		if !isReplay {
 			cmdBuffer = append(cmdBuffer, cmds)
 		}
 		cmdBufMu.Unlock()
 		response =  []byte(strResponse)
-
 	case "LRANGE" : 
 		syntaxError := resp.ErrorMsg(cmdsLen, 4, "LRANGE", "==")
 		if syntaxError != nil{
@@ -438,6 +437,122 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 				keys = keys + fmt.Sprintf("$%d\r\n%s\r\n", len((*data.listVal)[i]), (*data.listVal)[i])
 				}
 		response = []byte(keys)
+	case "LLEN" : 
+		syntaxError := resp.ErrorMsg(cmdsLen, 2, "LLEN", "==")
+		if syntaxError != nil{
+			return syntaxError
+		}
+		shardLocks[index].RLock()
+		defer shardLocks[index].RUnlock()
+		key := cmds[1]
+		if isExpired(key, index){
+			return []byte(":0\r\n")
+		}
+		data, ok := shards[index][key]
+		if !ok || data.kind != "list"{
+			    return []byte(":0\r\n")
+		}
+		size :=  len(*(data.listVal))
+		strResponse = fmt.Sprintf(":%d\r\n",size)
+		response = []byte(strResponse)
+	case "LPOP", "RPOP" : 
+		syntaxError := resp.ErrorMsg(cmdsLen, 2, cmds[0], ">=")
+		if syntaxError != nil{
+			return syntaxError
+		}
+		shardLocks[index].Lock()
+		defer shardLocks[index].Unlock()
+		key := cmds[1]
+		countProvided := false
+		var count int
+		if len(cmds) > 2 {
+			count,err = strconv.Atoi(cmds[2])
+			if err != nil {
+			fmt.Println(err)
+			return []byte("$-1\r\n")
+			}
+			countProvided = true
+		}
+
+		removeIfExpired(key, index)
+		var removedVals []string
+		data, ok := shards[index][key]
+		if ok {
+				if data.kind != "list"{
+				return []byte("-ERR value not a list\r\n")}
+				size :=  len(*(data.listVal))
+				if count < 0 {
+				return []byte("-ERR value is not an integer or out of range\r\n")}
+				if size == 0 {
+					delete(shards[index], key)
+					if countProvided {
+						return []byte("*0\r\n")
+					}
+					return []byte("$-1\r\n")
+				}
+
+				if !countProvided {
+					count = 1
+				}
+				if count > size  {
+					count = size
+				}
+				if strings.ToUpper(cmds[0])[0] == 'L'{
+					removedVals = (*data.listVal)[:count]
+					(*data.listVal) = (*data.listVal)[count:]
+				}else {
+					removedVals = (*data.listVal)[len(*data.listVal)-count:]
+					(*data.listVal) = (*data.listVal)[:len(*data.listVal)-count]}
+					strResponse = fmt.Sprintf("*%d\r\n", len(removedVals))
+					for i:=0; i < count; i++{
+					strResponse += fmt.Sprintf("$%d\r\n%s\r\n",len(removedVals[i]),removedVals[i])
+				}
+				cmdBufMu.Lock()
+				if !isReplay {
+					cmdBuffer = append(cmdBuffer, cmds)
+				}
+				cmdBufMu.Unlock()
+		} else {
+			if countProvided {
+        	return []byte("*0\r\n")
+    		}
+   		 	return []byte("$-1\r\n")
+		}
+		response =  []byte(strResponse)
+	case "LPUSHX", "RPUSHX" : 
+		syntaxError := resp.ErrorMsg(cmdsLen, 3, cmds[0], ">=")
+		if syntaxError != nil{
+			return syntaxError
+		}
+		shardLocks[index].Lock()
+		defer shardLocks[index].Unlock()
+		key := cmds[1]
+		removeIfExpired(key, index)
+		data, ok := shards[index][key]
+		var newValues []string
+		for i:=2; i<cmdsLen;i++{
+			newValues = append(newValues,cmds[i])
+				}
+		if ok {
+				if data.kind != "list"{
+				return []byte("-ERR value not a list\r\n")}
+				if strings.ToUpper(cmds[0])[0] == 'L'{
+						slices.Reverse(newValues)   
+						*(data.listVal) = append(newValues,*data.listVal...)
+				}else {
+						*(data.listVal) = append(*data.listVal,newValues...)}
+				shards[index][key] = data
+				strResponse = fmt.Sprintf(":%d\r\n",len(*data.listVal))
+				cmdBufMu.Lock()
+				if !isReplay {
+					cmdBuffer = append(cmdBuffer, cmds)
+				}
+				cmdBufMu.Unlock()
+		} else {
+			strResponse = ":0\r\n"
+		}
+		response =  []byte(strResponse)
+	
 	default:
 		response = []byte("-ERR unknown command\r\n")
 	}
