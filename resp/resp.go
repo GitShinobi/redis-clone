@@ -32,3 +32,30 @@ func ErrorMsg(size int, num int, cmd string, op string)([]byte){
 	}
 	return nil
 }
+
+func okResponse() []byte {
+    return []byte("+OK\r\n")
+}
+
+func intResponse(n int) []byte {
+    return []byte(fmt.Sprintf(":%d\r\n", n))
+}
+
+func bulkResponse(s string) []byte {
+    return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(s), s))
+}
+
+func nullResponse() []byte {
+    return []byte("$-1\r\n")
+}
+
+func emptyArrayResponse() []byte {
+    return []byte("*0\r\n")
+}
+func ArrayResponse(n int) []byte {
+    return []byte(fmt.Sprintf("*%d\r\n",n))
+}
+
+func errorResponse(msg string) []byte {
+    return []byte(fmt.Sprintf("-ERR %s\r\n", msg))
+}

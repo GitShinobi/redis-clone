@@ -24,14 +24,20 @@ type entry struct {
     expire  time.Time
 }
 
-var shards [16]map[string]entry
-var shardLocks [16]sync.RWMutex
+var shards [NumShards]map[string]entry
+var shardLocks [NumShards]sync.RWMutex
 var cmdBuffer [][]string
 var cmdBufMu sync.Mutex
 var fileMu sync.RWMutex
 
+const (
+    NumShards = 16
+    RewriteInterval = 24 * time.Hour
+    FlushThreshold = 10
+)
+
 func init() {
-	for i := 0; i < 16; i++ {
+	for i := 0; i < NumShards; i++ {
 		shards[i] = make(map[string]entry)
 	}
 }
@@ -66,12 +72,12 @@ func main() {
 	go func() {
 		for {
 			rewriteAOF()
-			time.Sleep(24 * time.Hour)
+			time.Sleep(RewriteInterval)
 		}
 	}()
 	go func() {
 		for {
-			for i := 0; i < 16; i++ {
+			for i := 0; i < NumShards; i++ {
 				keys := []string{}
 				shardLocks[i].Lock()
 				for k := range shards[i] {
@@ -83,7 +89,7 @@ func main() {
 				shardLocks[i].Unlock()
 			}
 			cmdBufMu.Lock()
-			if len(cmdBuffer) > 10 {
+			if len(cmdBuffer) > FlushThreshold {
 				appendCommand(cmdBuffer, "aof.log")
 				cmdBuffer = [][]string{}
 			}
@@ -168,53 +174,41 @@ func GetCmdSize(chunk string) string {
 }
 
 func writeResponse(cmds []string, isReplay bool) []byte {
-	var response []byte
+	response := []byte{}
 	var index int
-	var strResponse string
 	cmdsLen := len(cmds)
 	if cmdsLen > 1 {
-		index = shardIndex(cmds[1], 16)
+		index = shardIndex(cmds[1], NumShards)
 	}
 	switch strings.ToUpper(cmds[0]) {
 	case "PING":
-		response = []byte("+PONG\r\n")
+		return []byte("+PONG\r\n")
 	case "SET":
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, "SET", "==")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 3, "SET", "=="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
 		key := cmds[1]
 		val := cmds[2]
-		shards[index][key] = entry{"string",&val,nil,nil,&make(map[string]struct{}),time.Time{}}
-		cmdBufMu.Lock()
-		if !isReplay {
-			cmdBuffer = append(cmdBuffer, cmds)
-		}
-		cmdBufMu.Unlock()
-		response = []byte("+OK\r\n")
+		shards[index][key] = entry{"string",&val,nil,nil,nil,time.Time{}}
+		logToAOF(cmds,isReplay)
+		return resp.okResponse()
 	case "GET":
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, "GET", "==")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 2, "GET", "=="); err != nil {
+    		return err
 		}
-		shardLocks[index].Lock()
-		defer shardLocks[index].Unlock()
+		shardLocks[index].RLock()
+		defer shardLocks[index].RUnlock()
 		key := cmds[1]
-		removeIfExpired(key, index)
 		data, ok := shards[index][key]
-		if ok {
-			size := len([]byte(*(data.strVal)))
-			strResponse = fmt.Sprintf("$%d\r\n%s\r\n", size, *(data.strVal))
-		} else {
-			strResponse = "$-1\r\n"
+		if !ok || isExpired(key, index) {
+			return resp.nullResponse()
 		}
-		response = []byte(strResponse)
+		return resp.bulkResponse(*data.strVal)
 	case "DEL":
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, "DEL", "==")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 2, "DEL", "=="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
@@ -222,48 +216,40 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		removeIfExpired(key, index)
 		_, ok := shards[index][key]
 		if ok {
-			cmdBufMu.Lock()
-			if !isReplay {
-				cmdBuffer = append(cmdBuffer, cmds)
-			}
-			cmdBufMu.Unlock()
+			logToAOF(cmds,isReplay)
 			delete(shards[index], key)
-			strResponse = ":1\r\n"
+			return resp.intResponse(1)
 		} else {
-			strResponse = ":0\r\n"
+			return resp.intResponse(0)
 		}
-		response = []byte(strResponse)
-	case "EXISTS":
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, "EXISTS", "==")
-		if syntaxError != nil{
-			return syntaxError
+ 	case "EXISTS":
+		if err := resp.ErrorMsg(cmdsLen, 2, "EXISTS", "=="); err != nil {
+    		return err
 		}
-		shardLocks[index].Lock()
-		defer shardLocks[index].Unlock()
+		shardLocks[index].RLock()
+		defer shardLocks[index].RUnlock()
 		key := cmds[1]
-		removeIfExpired(key, index)
+		if isExpired(key, index){return resp.intResponse(0)}
 		_, ok := shards[index][key]
 		if ok {
-			strResponse = ":1\r\n"
+			return resp.intResponse(1)
 		} else {
-			strResponse = ":0\r\n"
+			return resp.intResponse(0)
 		}
-		response = []byte(strResponse)
-	case "EXPIRE":
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, "EXPIRE", "==")
-		if syntaxError != nil{
-			return syntaxError
+ 	case "EXPIRE":
+		if err := resp.ErrorMsg(cmdsLen, 3, "EXPIRE", "=="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
 		key := cmds[1]
-		removeIfExpired(key, index)
-		data, ok := shards[index][key]
 		if ok {
+			removeIfExpired(key, index)
+			data, ok := shards[index][key]
 			exp, err := strconv.Atoi(cmds[2])
 			if err != nil {
 				fmt.Println(err)
-				strResponse = "-ERR value is not an integer\r\n"
+				return resp.errorResponse("value is not an integer")
 			} else {
 				duration := time.Duration(exp) * time.Second
 				data.expire = time.Now().Add(duration)
@@ -273,36 +259,32 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 				}
 				cmdBufMu.Unlock()
 				shards[index][key] = data
-				strResponse = ":1\r\n"
+				return resp.intResponse(1)
 			}
 		} else {
-			strResponse = ":0\r\n"
+			return resp.intResponse(0)
 		}
-		response = []byte(strResponse)
-	case "TTL":
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, "TTL", "==")
-		if syntaxError != nil{
-			return syntaxError
+ 	case "TTL":
+		if err := resp.ErrorMsg(cmdsLen, 2, "TTL", "=="); err != nil {
+    		return err
 		}
-		shardLocks[index].Lock()
-		defer shardLocks[index].Unlock()
+		shardLocks[index].RLock()
+		defer shardLocks[index].RUnlock()
 		key := cmds[1]
-		removeIfExpired(key, index)
+		if isExpired(key, index){return resp.intResponse(-2)}
 		data, ok := shards[index][key]
 		if ok {
 			if data.expire.IsZero() {
-				strResponse = ":-1\r\n"
+				return resp.intResponse(-1)
 			} else {
-				strResponse = fmt.Sprintf(":%d\r\n", int(data.expire.Sub(time.Now()).Seconds()))
+				return resp.intResponse(int(data.expire.Sub(time.Now()).Seconds()))
 			}
 		} else {
-			strResponse = ":-2\r\n"
+				return resp.intResponse(-2)
 		}
-		response = []byte(strResponse)
-	case "EXPIREAT":
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, "EXPIREAT", "==")
-		if syntaxError != nil{
-			return syntaxError
+ 	case "EXPIREAT":
+		if err := resp.ErrorMsg(cmdsLen, 3, "EXPIREAT", "=="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
@@ -313,57 +295,53 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 			exp, err := strconv.Atoi(cmds[2])
 			if err != nil {
 				fmt.Println(err)
-				strResponse = "-ERR value is not an integer\r\n"
+				return resp.errorResponse("value is not an integer")
 			} else {
 				data.expire = time.Unix(int64(exp), 0)
 				shards[index][key] = data
-				strResponse = ":1\r\n"
-				cmdBufMu.Lock()
-				if !isReplay {
-					cmdBuffer = append(cmdBuffer, cmds)
-				}
-				cmdBufMu.Unlock()
+				logToAOF(cmds,isReplay)
+				return resp.intResponse(1)
 			}
 		} else {
-			strResponse = ":0\r\n"
+			return resp.intResponse(0)
 		}
-		response = []byte(strResponse)
-	case "DBSIZE" : 
+ 	case "DBSIZE" : 
+		if err := resp.ErrorMsg(cmdsLen, 1, "DBSIZE", "=="); err != nil {
+    		return err
+		}
 		keys := getDBSize() 
-		strResponse = fmt.Sprintf(":%d\r\n",keys)
-		response = []byte(strResponse)
-	case "KEYS" : 
-		size := getDBSize() 
-		if size == 0{
-				strResponse = "*0\r\n"
-				return []byte(strResponse)
+		return resp.intResponse(keys)
+ 	case "KEYS" : 
+	if err := resp.ErrorMsg(cmdsLen, 2, "KEYS", "=="); err != nil {
+    		return err
 		}
-		validKeys := 0
-		keys := ""
-		for i := 0; i < 16; i++ {
-				shardLocks[i].RLock()			
-				for k, _ := range shards[i] {
-					if isExpired(k, i){
-						continue
-					}
-					keys = keys + fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
-					validKeys++
-				}
-			shardLocks[i].RUnlock()	
-		}
-		keys = fmt.Sprintf("*%d\r\n",validKeys) + keys
-		response = []byte(keys)
+	var keys []string
+	for i := 0; i < NumShards; i++ {
+		shardLocks[i].RLock()			
+		for k := range shards[i] {
+        if !isExpired(k, i) {
+            keys = append(keys, k)
+        }
+    		}
+		shardLocks[i].RUnlock()	
+	}
+	if len(keys) == 0{
+			return resp.emptyArrayResponse()
+	}
+	return buildArrayResponse(keys)
 		case "FLUSHALL" : 
-		for i := 0; i < 16; i++ {
+		if err := resp.ErrorMsg(cmdsLen, 1, "FLUSHALL", "=="); err != nil {
+    		return err
+		}
+		for i := 0; i < NumShards; i++ {
 			shardLocks[i].Lock()
 				clear(shards[i])
 			shardLocks[i].Unlock()
 		}
-		response = []byte("+OK\r\n")
+		return resp.okResponse()
 	case "LPUSH", "RPUSH" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, cmds[0], ">=")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 3,cmds[0], ">="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
@@ -371,59 +349,51 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		removeIfExpired(key, index)
 		data, ok := shards[index][key]
 		var newValues []string
-		for i:=2; i<cmdsLen;i++{
+		for i:=2; i<cmdsLen; i++{
 			newValues = append(newValues,cmds[i])
 				}
 		if ok {
 				if data.kind != "list"{
-				return []byte("-ERR value not a list\r\n")}
+				return resp.errorResponse("value not a list")}
 				if strings.ToUpper(cmds[0])[0] == 'L'{
 						slices.Reverse(newValues)   
 						*(data.listVal) = append(newValues,*data.listVal...)
 				}else {
 						*(data.listVal) = append(*data.listVal,newValues...)}
-		
 		} else {
 			if strings.ToUpper(cmds[0])[0] == 'L'{
 				slices.Reverse(newValues)
 			}
-			data = entry{"list",nil,&newValues,nil,&make(map[string]struct{}), time.Time{}}
+			data = entry{"list",nil,&newValues,nil,nil, time.Time{}}
 			shards[index][key] = data
 		}
-		strResponse = fmt.Sprintf(":%d\r\n", len(*(data.listVal)))
 		shards[index][key] = data
-		cmdBufMu.Lock()
-		if !isReplay {
-			cmdBuffer = append(cmdBuffer, cmds)
-		}
-		cmdBufMu.Unlock()
-		response =  []byte(strResponse)
+		logToAOF(cmds,isReplay)
+		return resp.intResponse(len(*(data.listVal)))
 	case "LRANGE" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 4, "LRANGE", "==")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 4, "LRANGE", "=="); err != nil {
+    		return err
 		}
 		key := cmds[1]
 		start,startErr := strconv.Atoi(cmds[2])
 		stop,stopErr := strconv.Atoi(cmds[3])
 		if startErr != nil || stopErr != nil {
-			return []byte("-ERR value start/stop is not integer\r\n" )
+			return resp.errorResponse("value start/stop is not integer")
 		}
 		shardLocks[index].RLock()
 		defer shardLocks[index].RUnlock()
 		if isExpired(key, index){
-			return []byte("*0\r\n")
+			return resp.emptyArrayResponse()
 		}
 		data, ok := shards[index][key]
 		if !ok{
-			return []byte("-ERR key don't exist\r\n")
+			return  resp.emptyArrayResponse()
 		}
 		if data.kind != "list"{
-				return []byte("-ERR value not a list\r\n")
-				}
+				return resp.errorResponse("value not a list")}
 		size :=  len(*(data.listVal))
 		if size == 0{
-				return []byte("*0\r\n")
+				return resp.emptyArrayResponse()
 		}
 		if start < 0 {
 			 start = size + start 
@@ -431,35 +401,26 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 							}
 		if stop < 0 { stop = size + stop }
 		if stop >= size {stop = size-1}
-		if start >= size || start > stop  {return []byte("*0\r\n")}
-		listLen := stop - start + 1
-		strResponse =  fmt.Sprintf("*%d\r\n",listLen)
-			for  i := start; i <= stop; i++ {
-				strResponse = strResponse + fmt.Sprintf("$%d\r\n%s\r\n", len((*data.listVal)[i]), (*data.listVal)[i])
-				}
-		response = []byte(strResponse)
-	case "LLEN" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, "LLEN", "==")
-		if syntaxError != nil{
-			return syntaxError
+		if start >= size || start > stop  {return resp.emptyArrayResponse()}
+		return buildArrayResponse((*data.listVal)[start:stop+1])
+ 	case "LLEN" : 
+		if err := resp.ErrorMsg(cmdsLen, 2, "LLEN", "=="); err != nil {
+    		return err
 		}
 		shardLocks[index].RLock()
 		defer shardLocks[index].RUnlock()
 		key := cmds[1]
 		if isExpired(key, index){
-			return []byte(":0\r\n")
+			return resp.intResponse(0)
 		}
 		data, ok := shards[index][key]
 		if !ok || data.kind != "list"{
-			    return []byte(":0\r\n")
+			return resp.intResponse(0)
 		}
-		size :=  len(*(data.listVal))
-		strResponse = fmt.Sprintf(":%d\r\n",size)
-		response = []byte(strResponse)
-	case "LPOP", "RPOP" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, cmds[0], ">=")
-		if syntaxError != nil{
-			return syntaxError
+		return resp.intResponse(len(*(data.listVal)))
+ 	case "LPOP", "RPOP" : 
+		if err := resp.ErrorMsg(cmdsLen, 2, cmds[0], ">="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
@@ -470,28 +431,26 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 			count,err = strconv.Atoi(cmds[2])
 			if err != nil {
 			fmt.Println(err)
-			return []byte("$-1\r\n")
+			return resp.nullResponse()
 			}
 			countProvided = true
 		}
-
 		removeIfExpired(key, index)
 		var removedVals []string
 		data, ok := shards[index][key]
 		if ok {
 				if data.kind != "list"{
-				return []byte("-ERR value not a list\r\n")}
+				return resp.errorResponse("value not a list")}
 				size :=  len(*(data.listVal))
 				if count < 0 {
-				return []byte("-ERR value is not an integer or out of range\r\n")}
+				return resp.errorResponse("value is not an integer or out of range")}
 				if size == 0 {
 					delete(shards[index], key)
 					if countProvided {
-						return []byte("*0\r\n")
+						return resp.emptyArrayResponse()
 					}
-					return []byte("$-1\r\n")
+					return resp.nullResponse()
 				}
-
 				if !countProvided {
 					count = 1
 				}
@@ -503,27 +462,22 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 					(*data.listVal) = (*data.listVal)[count:]
 				}else {
 					removedVals = (*data.listVal)[len(*data.listVal)-count:]
-					(*data.listVal) = (*data.listVal)[:len(*data.listVal)-count]}
-					strResponse = fmt.Sprintf("*%d\r\n", len(removedVals))
-					for i:=0; i < count; i++{
-					strResponse += fmt.Sprintf("$%d\r\n%s\r\n",len(removedVals[i]),removedVals[i])
+					(*data.listVal) = (*data.listVal)[:len(*data.listVal)-count]
 				}
-				cmdBufMu.Lock()
-				if !isReplay {
-					cmdBuffer = append(cmdBuffer, cmds)
-				}
-				cmdBufMu.Unlock()
+				logToAOF(cmds,isReplay)
+				if !countProvided {
+    				return resp.bulkResponse(removedVals[0])
+					}
+				return buildArrayResponse(removedVals)
 		} else {
 			if countProvided {
-        	return []byte("*0\r\n")
+        	return resp.emptyArrayResponse()
     		}
-   		 	return []byte("$-1\r\n")
+   		 	return resp.nullResponse()
 		}
-		response =  []byte(strResponse)
 	case "LPUSHX", "RPUSHX" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, cmds[0], ">=")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 3, cmds[0], ">="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
@@ -531,32 +485,26 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		removeIfExpired(key, index)
 		data, ok := shards[index][key]
 		var newValues []string
-		for i:=2; i<cmdsLen;i++{
-			newValues = append(newValues,cmds[i])
+		for i:=2; i<cmdsLen; i++{
+			newValues = append(newValues, cmds[i])
 				}
 		if ok {
 				if data.kind != "list"{
-				return []byte("-ERR value not a list\r\n")}
+				return resp.errorResponse("value not a list")}
 				if strings.ToUpper(cmds[0])[0] == 'L'{
 						slices.Reverse(newValues)   
 						*(data.listVal) = append(newValues,*data.listVal...)
 				}else {
 						*(data.listVal) = append(*data.listVal,newValues...)}
 				shards[index][key] = data
-				strResponse = fmt.Sprintf(":%d\r\n",len(*data.listVal))
-				cmdBufMu.Lock()
-				if !isReplay {
-					cmdBuffer = append(cmdBuffer, cmds)
-				}
-				cmdBufMu.Unlock()
+				logToAOF(cmds,isReplay)
+				return resp.intResponse(len(*data.listVal))
 		} else {
-			strResponse = ":0\r\n"
+			return resp.intResponse(0)
 		}
-		response =  []byte(strResponse)
 	case "SADD":
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, "SADD", ">=")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 3, "SADD", ">="); err != nil {
+    		return err
 		}
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
@@ -568,107 +516,96 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 			data = entry{"set",nil,nil,nil,&setVal,time.Time{}}
 		}
 		if data.kind != "set"{
-			return []byte("-ERR value not a set\r\n")
+			return resp.errorResponse("value not a set")
 			}
 		setlen := 0
 		for i:=2; i<cmdsLen;i++{
-		if val, ok := data.setVal[cmds[i]]; !ok{
+		if _, ok := data.setVal[cmds[i]]; !ok{
 			data.setVal[cmds[i]] = struct{}{}
 			setlen++
 			}
 		}
-		strResponse = fmt.Sprintf( ":%d\r\n",setlen)
 		shards[index][key] = data
-		cmdBufMu.Lock()
-		if !isReplay {
-			cmdBuffer = append(cmdBuffer, cmds)
-		}
-		cmdBufMu.Unlock()
-		response =  []byte(strResponse)
+		logToAOF(cmds,isReplay)
+		return resp.intResponse(setlen)
 	case "SMEMBERS" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, "SMEMBERS", "==")
-		if syntaxError != nil{
-			return syntaxError
+		if err := resp.ErrorMsg(cmdsLen, 2, "SMEMBERS", "=="); err != nil {
+    		return err
 		}
 		key := cmds[1]
 		shardLocks[index].RLock()			
 		defer shardLocks[index].RUnlock()
 		data, ok := shards[index][key]
 		if !ok{
-			return []byte("*0\r\n")
+			return resp.emptyArrayResponse()
 		}
 		if data.kind != "set"{
-				return []byte("-ERR value not a set\r\n")
+				return resp.errorResponse("value not a set")
 				}	
 		if isExpired(key, index) || len(*(data.setVal)) == 0 {
-				return []byte("*0\r\n")
+				return resp.emptyArrayResponse()
 		}
-		strResponse = fmt.Sprintf("*%d\r\n",len(*data.setVal))
-		for k, _ := range *data.setVal {
-			strResponse += fmt.Sprintf("$%d\r\n%s\r\n",len(k),k)
+		keys := make([]string, 0, len(*data.setVal))
+		for k := range *data.setVal {
+			keys = append(keys, k)
 		}
-		response = []byte(strResponse)
-	case "SISMEMBER":
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, "SISMEMBER", "==")
-		if syntaxError != nil{
-			return syntaxError
+		return buildArrayResponse(keys)
+ 	case "SISMEMBER":
+		if err := resp.ErrorMsg(cmdsLen, 3, "SISMEMBER", "=="); err != nil {
+    		return err
 		}
 		key := cmds[1]
 		member := cmds[2]
 		shardLocks[index].RLock()
 		defer shardLocks[index].RUnlock()
-		if isExpired(key, index){ return []byte(":0\r\n")}	
+		if isExpired(key, index){ return resp.intResponse(0)}	
 		data , ok := shards[index][key]
 		if !ok {
-			 return []byte(":0\r\n")
+			 return resp.intResponse(0)
 		}
 		if data.kind != "set"{
-			return []byte("-ERR value not a set\r\n")
+			return resp.errorResponse("value not a set")
 			}
 		_ , ok := (*data.setVal)[member]
 		if ok {
-			strResponse = ":1\r\n"
+			return resp.intResponse(1)
 		}else{
-			strResponse = ":0\r\n"
+			return resp.intResponse(0)
 		}
-		response = []byte(strResponse)
-	case "SCARD" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 2, "SCARD", "==")
-		if syntaxError != nil{
-			return syntaxError
+ 	case "SCARD" : 
+		if err := resp.ErrorMsg(cmdsLen, 2, "SCARD", "=="); err != nil {
+    		return err
 		}
 		key := cmds[1]
 		shardLocks[index].RLock()			
 		defer shardLocks[index].RUnlock()
 		data, ok := shards[index][key]
 		if !ok{
-			return []byte(":0\r\n")
+			return resp.intResponse(0)
 		}
 		if data.kind != "set"{
-				return []byte("-ERR value not a set\r\n")
+				return resp.errorResponse("value not a set")
 				}	
 		if isExpired(key, index) || len(*(data.setVal)) == 0 {
-				return []byte(":0\r\n")
+				return resp.intResponse(0)
 		}
-		strResponse = fmt.Sprintf(":%d\r\n",len(*data.setVal))
-		response = []byte(strResponse)
-	case "SREM" : 
-		syntaxError := resp.ErrorMsg(cmdsLen, 3, "SREM", ">=")
-		if syntaxError != nil{
-			return syntaxError
+		return resp.intResponse(len(*data.setVal))
+ 	case "SREM" : 
+		if err := resp.ErrorMsg(cmdsLen, 3, "SREM", ">="); err != nil {
+    		return err
 		}
 		key := cmds[1]
 		shardLocks[index].Lock()			
 		defer shardLocks[index].Unlock()
 		if removeIfExpired(key, index) {
-				return []byte(":0\r\n")
+				return  resp.intResponse(0)
 		}
 		data, ok := shards[index][key]
 		if !ok{
-			return []byte(":0\r\n")
+			return  resp.intResponse(0)
 		}
 		if data.kind != "set"{
-				return []byte("-ERR value not a set\r\n")
+				return resp.errorResponse("value not a set")
 				}	
 		removedNbr := 0
 		for i:=2; i<cmdsLen; i++{
@@ -683,15 +620,10 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		}else{
 			shards[index][key] = data
 		}
-		cmdBufMu.Lock()
-		if !isReplay {
-			cmdBuffer = append(cmdBuffer, cmds)
-		}
-		cmdBufMu.Unlock()
-		strResponse = fmt.Sprintf(":%d\r\n",removedNbr)
-		response = []byte(strResponse)
-	default:
-		response = []byte("-ERR unknown command\r\n")
+		logToAOF(cmds,isReplay)
+		return resp.intResponse(removedNbr)
+ 	default:
+			return resp.errorResponse("unknown command")
 	}
 	return response
 }
@@ -713,7 +645,7 @@ func isExpired(key string, index int) bool {
 
 func rewriteAOF() {
 	var content []byte
-	for i := 0; i < 16; i++ {
+	for i := 0; i < NumShards; i++ {
 		shardLocks[i].Lock()
 		snapshot := make(map[string]entry, len(shards[i]))
 		for k, v := range shards[i] {
@@ -771,7 +703,7 @@ func shardIndex(key string, numShards int) int {
 
 func getDBSize() int{
 	keys := 0
-	for i := 0; i < 16; i++ {
+	for i := 0; i < NumShards; i++ {
 		shardLocks[i].RLock()
 		for k, _ := range shards[i] {
            	if isExpired(k,i){
@@ -782,4 +714,20 @@ func getDBSize() int{
 		shardLocks[i].RUnlock()
 	} 
 	return keys
+}
+
+func logToAOF(cmds []string, isReplay bool) {
+    if isReplay {
+        return
+    }
+    cmdBufMu.Lock()
+    cmdBuffer = append(cmdBuffer, cmds)
+    cmdBufMu.Unlock()
+}
+func buildArrayResponse(elements []string) []byte {
+    response := resp.ArrayResponse(len(elements))
+    for _, e := range elements {
+        response = append(response, resp.bulkResponse(e)...)
+    }
+    return response
 }
