@@ -26,36 +26,38 @@ func ErrorMsg(size int, num int, cmd string, op string)([]byte){
 		valid = size >= num
 	default:
 		return []byte(fmt.Sprintf("-ERR internal error: invalid operator '%s' for command '%s'\r\n", op, cmd))	}
- 	  if !valid {
+ 	if !valid {
 		strResponse := fmt.Sprintf("-ERR wrong number of arguments for '%s' command\r\n",cmd)
 		return []byte(strResponse)  
 	}
 	return nil
 }
 
-func okResponse() []byte {
+func Ping()[]byte{
+	return []byte("+PONG\r\n")
+}
+func OkResponse() []byte {
     return []byte("+OK\r\n")
 }
-
-func intResponse(n int) []byte {
+func IntResponse(n int) []byte {
     return []byte(fmt.Sprintf(":%d\r\n", n))
 }
 
-func bulkResponse(s string) []byte {
+func BulkResponse(s string) []byte {
     return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(s), s))
 }
 
-func nullResponse() []byte {
+func NullResponse() []byte {
     return []byte("$-1\r\n")
 }
 
-func emptyArrayResponse() []byte {
+func EmptyArrayResponse() []byte {
     return []byte("*0\r\n")
 }
 func ArrayResponse(n int) []byte {
     return []byte(fmt.Sprintf("*%d\r\n",n))
 }
 
-func errorResponse(msg string) []byte {
+func ErrorResponse(msg string) []byte {
     return []byte(fmt.Sprintf("-ERR %s\r\n", msg))
 }
