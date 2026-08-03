@@ -243,9 +243,9 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
 		key := cmds[1]
+		data, ok := shards[index][key]
 		if ok {
 			removeIfExpired(key, index)
-			data, ok := shards[index][key]
 			exp, err := strconv.Atoi(cmds[2])
 			if err != nil {
 				fmt.Println(err)
@@ -428,11 +428,12 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		countProvided := false
 		var count int
 		if len(cmds) > 2 {
-			count,err = strconv.Atoi(cmds[2])
+			nbr, err := strconv.Atoi(cmds[2])
 			if err != nil {
 			fmt.Println(err)
 			return resp.NullResponse()
 			}
+			count = nbr
 			countProvided = true
 		}
 		removeIfExpired(key, index)
@@ -520,8 +521,8 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 			}
 		setlen := 0
 		for i:=2; i<cmdsLen;i++{
-		if _, ok := data.setVal[cmds[i]]; !ok{
-			data.setVal[cmds[i]] = struct{}{}
+		if _, ok := (*data.setVal)[cmds[i]]; !ok{
+			(*data.setVal)[cmds[i]] = struct{}{}
 			setlen++
 			}
 		}
@@ -566,8 +567,8 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		if data.kind != "set"{
 			return resp.ErrorResponse("value not a set")
 			}
-		_ , ok := (*data.setVal)[member]
-		if ok {
+		_ , exist := (*data.setVal)[member]
+		if exist {
 			return resp.IntResponse(1)
 		}else{
 			return resp.IntResponse(0)
@@ -609,7 +610,7 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 				}	
 		removedNbr := 0
 		for i:=2; i<cmdsLen; i++{
-			_, ok := *(data.setVal)[cmds[i]]
+			_, ok := (*data.setVal)[cmds[i]]
 			if ok {
 				delete(*data.setVal, cmds[i])
 				removedNbr++
@@ -639,9 +640,9 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 				}
 			_, ok := (*data.hashVal)[field]
 			if ok {
-				response = resp.IntResponse(0)
+				return resp.IntResponse(0)
 			}else{
-				response = resp.IntResponse(1)
+				return resp.IntResponse(1)
 			}
 			(*data.hashVal)[field] = val
 			shards[index][key] = data
@@ -711,7 +712,7 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		if data.kind != "hash"{
 		return resp.ErrorResponse("value not a hash")}
 		for i:= 2; i<cmdsLen; i++{
-			_, ok := *(data.hashVal)[cmds[i]]
+			_, ok := (*data.hashVal)[cmds[i]]
 			if ok {
 				delete(*data.hashVal, cmds[i])
 				count++
@@ -740,8 +741,8 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		if data.kind != "hash"{
 			return resp.ErrorResponse("value not a hash")
 			}
-		_ , ok := (*data.hashVal)[field]
-		if ok {
+		_ , exist := (*data.hashVal)[field]
+		if exist {
 			return resp.IntResponse(1)
 		}else{
 			return resp.IntResponse(0)
@@ -795,16 +796,59 @@ func rewriteAOF() {
 		shardLocks[i].Unlock()
 		var timeCmd string
 		for key, entry := range snapshot {
-			if !entry.expire.IsZero() && entry.expire.Before(time.Now()) || entry.kind != "string" {
+			var sb strings.Builder
+			if !entry.expire.IsZero() && entry.expire.Before(time.Now()) {
 				continue
 			}
-			valCmd := fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(*(entry.strVal)), *(entry.strVal))
+			switch entry.kind {
+			case "string" :
+				if entry.strVal == nil {
+					continue
+				 }
+				sb.WriteString(fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(*(entry.strVal)), *(entry.strVal)))
+
+			case "list":
+				if entry.listVal == nil || len(*entry.listVal) == 0 {
+					continue
+				}
+
+				sb.WriteString(fmt.Sprintf("*%d\r\n", len(*(entry.listVal))+2)) 
+				sb.WriteString("$5\r\nRPUSH\r\n")
+				sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(key), key))				
+				for i := range *entry.listVal {
+					sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len((*entry.listVal)[i]), (*entry.listVal)[i]))
+				}
+			case "set":
+				if entry.setVal == nil || len(*entry.setVal) == 0 {
+				continue
+					}
+				sb.WriteString(fmt.Sprintf("*%d\r\n", len(*(entry.setVal))+2)) 
+				sb.WriteString("$4\r\nSADD\r\n")
+				sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(key), key))				
+				for k := range *entry.setVal {
+					sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(k), k))
+				}
+			case "hash":
+				if entry.hashVal == nil || len(*entry.hashVal) == 0 {
+					continue
+			}
+				sb.WriteString(fmt.Sprintf("*%d\r\n", len(*(entry.hashVal))*2 + 2)) 
+				sb.WriteString("$4\r\nHSET\r\n")
+				sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(key), key))				
+				for k,v := range *entry.hashVal {
+					sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(k), k))
+					sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(v), v))
+				}
+			default:
+				continue
+    		}
+			valCmd := sb.String()
 			content = append(content, []byte(valCmd)...)
 			if !entry.expire.IsZero() {
 				timeCmd = fmt.Sprintf("*3\r\n$8\r\nEXPIREAT\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(strconv.Itoa(int(entry.expire.Unix()))), strconv.Itoa(int(entry.expire.Unix())))
 				content = append(content, []byte(timeCmd)...)
-			}
-		}
+				}
+			}		
 	}
 	fileMu.Lock()
 	err := os.WriteFile("aof.log", content, 0666)
