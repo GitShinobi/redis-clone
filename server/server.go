@@ -110,6 +110,8 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
+	inTransaction := false
+	var queue [][]string
 	for {
 		cmds, err := readCommand(reader)
 		if err != nil {
@@ -120,12 +122,52 @@ func handleConnection(conn net.Conn) {
 			}
 			return
 		}
-		if len(cmds) == 0 {
-			fmt.Println("no command found")
-			return
+		var response []byte
+		switch strings.ToUpper(cmds[0]) {
+			case "MULTI" :
+				if inTransaction {
+					response = resp.ErrorResponse("MULTI calls can not be nested")
+					conn.Write(response)
+					continue	
+				}
+				inTransaction = true
+				queue = [][]string{}
+				response = resp.OkResponse() 
+				conn.Write(response)
+			case "EXEC" :
+				if !inTransaction {
+					response = resp.ErrorResponse("EXEC without MULTI")
+					conn.Write(response)
+					continue	
+					}
+				arrayLen := fmt.Sprintf("*%d\r\n", len(queue))
+				response = append(response,[]byte(arrayLen))
+				for i := range queue {
+					response = append(response, writeResponse((queue)[i], false))
+				}
+				conn.Write(response)
+				inTransaction = false
+				queue = nil
+			case "DISCARD" :
+				if !inTransaction {
+					response = resp.ErrorResponse("DISCARD without MULTI")
+					conn.Write(response)
+					continue
+					}
+				inTransaction = false
+				queue = nil
+				response = resp.OkResponse()
+				conn.Write(response)
+			default :
+			if inTransaction {
+				queue = append(queue,cmds)
+				response = resp.queuedResponse()
+				conn.Write(response)
+			}else{
+				response = writeResponse(cmds, false)
+				conn.Write(response)
+			}
 		}
-		response := writeResponse(cmds, false)
-		conn.Write(response)
 	}
 }
 
@@ -155,10 +197,8 @@ func readCommand(reader *bufio.Reader) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		cmdVal := string(cmdBuf)
 		cmds = append(cmds, cmdVal)
-
 		_, err = reader.ReadString('\n')
 		if err != nil {
 			return nil, err
@@ -174,6 +214,9 @@ func GetCmdSize(chunk string) string {
 }
 
 func writeResponse(cmds []string, isReplay bool) []byte {
+	if len(cmds) == 0 {
+			return []byte{"no command found"}
+		}
 	response := []byte{}
 	var index int
 	cmdsLen := len(cmds)
@@ -744,9 +787,8 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		_ , exist := (*data.hashVal)[field]
 		if exist {
 			return resp.IntResponse(1)
-		}else{
-			return resp.IntResponse(0)
 		}
+		return resp.IntResponse(0)
 	case "HLEN" : 
 		if err := resp.ErrorMsg(cmdsLen, 2, cmds[0], "=="); err != nil {
     		return err
@@ -915,4 +957,4 @@ func buildArrayResponse(elements []string) []byte {
         response = append(response, resp.BulkResponse(e)...)
     }
     return response
-}
+}    

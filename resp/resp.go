@@ -36,6 +36,9 @@ func ErrorMsg(size int, num int, cmd string, op string)([]byte){
 func Ping()[]byte{
 	return []byte("+PONG\r\n")
 }
+func queuedResponse()[]byte{
+	return []byte("+QUEUED\r\n")
+}
 func OkResponse() []byte {
     return []byte("+OK\r\n")
 }
