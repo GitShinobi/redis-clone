@@ -286,6 +286,12 @@ func writeResponse(cmds []string, isReplay bool) []byte {
 		return HandleHExists(cmds, index, isReplay)
 	case "HLEN" : 
 		return HandleHLen(cmds, index, isReplay)
+	case "LINDEX":
+		return HandleLIndex(cmds, index, isReplay)
+	case "LSET" :
+		return HandleLSet(cmds, index, isReplay)
+	case "LTRIM" :
+		return HandleLTrim(cmds, index, isReplay)
  	default:
 			return resp.ErrorResponse("unknown command")
 	}
@@ -443,8 +449,6 @@ func getMinArgs(cmd string) (int,string){
 	op := "=="
 	min :=1
 	switch strings.ToUpper(cmd) {
-		case "PING", "DBSIZE", "FLUSHALL", "MULTI", "EXEC", "DISCARD":
-    	min = 1
 		case "SET":
 			min = 3
 		case "GET":
@@ -500,6 +504,14 @@ func getMinArgs(cmd string) (int,string){
 			min = 3
 		case "HLEN" : 
 			min = 2
+		case "LINDEX":
+			min = 3
+		case "LSET":
+			min = 4
+		case "LTRIM":
+			min = 4
+		case "PING", "DBSIZE", "FLUSHALL", "MULTI", "EXEC", "DISCARD":
+    		min = 1
 	}
 	return min, op
 }
@@ -1128,4 +1140,109 @@ func HandlePing() []byte {
 		}
 		return resp.IntResponse(len(*data.hashVal))
 	}
- 
+	func HandleLIndex(cmds []string, index int, isReplay bool) []byte {
+		key := cmds[1]
+		pos , err := strconv.Atoi(cmds[2]) 
+		if err != nil {
+			fmt.Println(err)
+			return resp.ErrorResponse("value is not an integer")
+			}
+		shardLocks[index].RLock()			
+		defer shardLocks[index].RUnlock()
+		data, ok := shards[index][key]
+		if !ok{
+			return resp.NullResponse()
+		}
+		if data.kind != "list"{
+			return resp.ErrorResponse("value not a list")
+		}
+		size := len(*data.listVal)
+		if isExpired(key, index) || size == 0 || pos  >= size || pos * -1  > size  {
+			return resp.NullResponse()
+		}	
+		if pos  < 0 {
+			pos = size + pos
+			return resp.BulkResponse((*data.listVal)[pos])
+		}
+		return resp.BulkResponse((*data.listVal)[pos ])
+	}
+	func HandleLSet(cmds []string, index int, isReplay bool) []byte {
+		key := cmds[1]
+		pos , err := strconv.Atoi(cmds[2]) 
+		val := cmds[3]
+		if err != nil {
+			fmt.Println(err)
+			return resp.ErrorResponse("value is not an integer")
+			}
+		shardLocks[index].Lock()			
+		defer shardLocks[index].Unlock()
+		data, ok := shards[index][key]
+		if !ok{
+			return resp.ErrorResponse("no such key")
+		}
+		if data.kind != "list"{
+			return resp.ErrorResponse("value not a list")
+		}
+		size := len(*data.listVal)
+		if isExpired(key, index) || size == 0 {
+			return resp.ErrorResponse("no such key")
+		}
+		if pos  >= size || pos * -1  > size  {
+			return resp.ErrorResponse("index out of range")
+		}	
+		if pos  < 0 {
+			pos = size + pos
+		}
+		(*data.listVal)[pos] = val
+		shards[index][key] = data
+		logToAOF(cmds,isReplay)
+		return resp.OkResponse()
+	}
+
+	func HandleLTrim(cmds []string, index int, isReplay bool) []byte {
+		key := cmds[1]
+		start , err := strconv.Atoi(cmds[2]) 
+		if err != nil {
+			fmt.Println(err)
+			return resp.ErrorResponse("value is not an integer")
+			}
+		stop , err := strconv.Atoi(cmds[3]) 
+		if err != nil {
+			fmt.Println(err)
+			return resp.ErrorResponse("value is not an integer")
+			}
+		shardLocks[index].Lock()			
+		defer shardLocks[index].Unlock()
+		data, ok := shards[index][key]
+		if !ok{
+			return resp.OkResponse()
+		}
+		if data.kind != "list"{
+			return resp.ErrorResponse("value not a list")
+		}
+		size := len(*data.listVal)
+		if isExpired(key, index) || size == 0 {
+			return resp.OkResponse()
+		}
+		logToAOF(cmds,isReplay)
+		if start  < 0 {
+			start = size + start
+		}
+		if stop  < 0 {
+			stop = size + stop
+		}
+		if stop >= size { stop = size - 1 }
+		if start > stop || start >= size || start < 0 || stop < 0{
+			delete(shards[index], key)
+			return resp.OkResponse()
+		}
+		if start == stop{
+			*data.listVal = []string{(*data.listVal)[start]}
+		}else{
+			*data.listVal = (*data.listVal)[start : stop + 1]
+		}
+		shards[index][key] = data
+		return resp.OkResponse()
+	}
+
+	
