@@ -6,11 +6,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"redis/resp"
 	"strconv"
 	"strings"
 	"time"
-	"os/exec"
 )
 
 func main() {
@@ -36,26 +36,28 @@ func main() {
 				return
 			}
 			timeout++
-			if timeout == 1000{
+			if timeout == 1000 {
 				break
 			}
 			continue
 		}
-		quotedCmd:=""
-		quoted:=0
-		for i:=0; i<len(cmd); i++{
-		if cmd[i] == '"' {
-			quoted++
-			if quoted == 2 { break }
-			continue
+		quotedCmd := ""
+		quoted := 0
+		for i := 0; i < len(cmd); i++ {
+			if cmd[i] == '"' {
+				quoted++
+				if quoted == 2 {
+					break
+				}
+				continue
 			}
 			if quoted == 1 {
 				quotedCmd += string(cmd[i])
 			}
 		}
 		cmdTab := strings.Fields(cmd)
-		if quoted == 2{
-			cmdTab = []string {cmdTab[0],cmdTab[1],quotedCmd}
+		if quoted == 2 {
+			cmdTab = []string{cmdTab[0], cmdTab[1], quotedCmd}
 		}
 		if len(cmdTab) == 0 {
 			continue
@@ -68,9 +70,9 @@ func main() {
 			cmd := exec.Command("clear")
 			cmd.Stdout = os.Stdout
 			if err := cmd.Run(); err != nil {
-     		fmt.Printf("Command failed: %v\n", err)
-   			 }
-			 continue
+				fmt.Printf("Command failed: %v\n", err)
+			}
+			continue
 		}
 		conn.Write(resp.EncodeCommand(cmdTab))
 		stop := 0
@@ -86,12 +88,12 @@ func main() {
 					return
 				}
 				timeout++
-				if timeout == 100{
-				break
-			}
+				if timeout == 100 {
+					break
+				}
 				continue
 			}
-			if !(response[0] == '+' || response[0] == '-' || response[0] == ':' || response[0] == '$' || response[0] == '*'){
+			if !(response[0] == '+' || response[0] == '-' || response[0] == ':' || response[0] == '$' || response[0] == '*') {
 				fmt.Print("-ERR unknown response\r\n")
 				break
 			}
@@ -108,15 +110,15 @@ func main() {
 					fmt.Print(err)
 					break
 				}
-				count += num  
+				count += num
 			}
 
-			if response[0] == '$'{
+			if response[0] == '$' {
 				valLine, err := connReader.ReadString('\n')
 				if err != nil {
 					break
 				}
-				fmt.Printf("\"%s\" \n",strings.TrimSuffix(valLine,"\r\n"))
+				fmt.Printf("\"%s\" \n", strings.TrimSuffix(valLine, "\r\n"))
 			}
 
 			if count == stop {

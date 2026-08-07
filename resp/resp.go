@@ -25,7 +25,7 @@ func ErrorMsg(size int, num int, cmd string, op string)([]byte){
 	case ">=":
 		valid = size >= num
 	default:
-		return []byte(fmt.Sprintf("-ERR internal error: invalid operator '%s' for command '%s'\r\n", op, cmd))	}
+		return fmt.Appendf(nil, "-ERR internal error: invalid operator '%s' for command '%s'\r\n", op, cmd)	}
  	if !valid {
 		strResponse := fmt.Sprintf("-ERR wrong number of arguments for '%s' command\r\n",cmd)
 		return []byte(strResponse)  
@@ -43,11 +43,11 @@ func OkResponse() []byte {
     return []byte("+OK\r\n")
 }
 func IntResponse(n int) []byte {
-    return []byte(fmt.Sprintf(":%d\r\n", n))
+    return fmt.Appendf(nil, ":%d\r\n", n)
 }
 
 func BulkResponse(s string) []byte {
-    return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(s), s))
+    return fmt.Appendf(nil, "$%d\r\n%s\r\n", len(s), s)
 }
 
 func NullResponse() []byte {
@@ -58,9 +58,9 @@ func EmptyArrayResponse() []byte {
     return []byte("*0\r\n")
 }
 func ArrayResponse(n int) []byte {
-    return []byte(fmt.Sprintf("*%d\r\n",n))
+    return fmt.Appendf(nil, "*%d\r\n",n)
 }
 
 func ErrorResponse(msg string) []byte {
-    return []byte(fmt.Sprintf("-ERR %s\r\n", msg))
+    return fmt.Appendf(nil, "-ERR %s\r\n", msg)
 }

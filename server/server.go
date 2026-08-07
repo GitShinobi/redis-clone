@@ -29,6 +29,10 @@ var shardLocks [NumShards]sync.RWMutex
 var cmdBuffer [][]string
 var cmdBufMu sync.Mutex
 var fileMu sync.RWMutex
+var keyVersionsMu sync.Mutex
+
+var keyVersions map[string]int
+
 
 const (
     NumShards = 16
@@ -40,6 +44,8 @@ func init() {
 	for i := 0; i < NumShards; i++ {
 		shards[i] = make(map[string]entry)
 	}
+	keyVersions = make(map[string]int)
+
 }
 func main() {
 	listener, err := net.Listen("tcp", "localhost:8080")
@@ -112,6 +118,7 @@ func HandleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	inTransaction := false
 	var queue [][]string
+	watchedKeys := make(map[string]int)
 	for {
 		cmds, err := readCommand(reader)
 		if err != nil {
@@ -121,8 +128,22 @@ func HandleConnection(conn net.Conn) {
 				fmt.Println("failed reading command : ", err)
 			}
 			return
-		}
+			}
 		var response []byte
+		if len(cmds) == 0 {
+			response =  resp.ErrorResponse("no command found")
+			conn.Write(response)
+				continue
+		}
+		min, op := getMinArgs(cmds[0]) 
+		if err := resp.ErrorMsg(len(cmds), min, cmds[0], op); err != nil {
+				conn.Write(err)
+				continue
+			}
+		index := 0
+		if len(cmds) > 1 {
+			index = shardIndex(cmds[1], NumShards)
+		}
 		switch strings.ToUpper(cmds[0]) {
 			case "MULTI" :
 				if inTransaction {
@@ -132,18 +153,49 @@ func HandleConnection(conn net.Conn) {
 				}
 				inTransaction = true
 				queue = [][]string{}
-				response = resp.OkResponse() 
 				conn.Write(response)
-			case "EXEC" :
+			case "WATCH" :
+				shardLocks[index].Lock()
+				for i := 1; i < len(cmds); i++ { 
+					key := cmds[i]
+					keyVersionsMu.Lock()
+					watchedKeys[key] = 	keyVersions[key]
+					keyVersionsMu.Unlock()
+				}
+				shardLocks[index].Unlock()
+				response = resp.OkResponse()
+				conn.Write(response)
+			case "UNWATCH" :
+				clear(watchedKeys)
+				response = resp.OkResponse()
+				conn.Write(response)
+				continue
+ 			case "EXEC" :
 				if !inTransaction {
 					response = resp.ErrorResponse("EXEC without MULTI")
 					conn.Write(response)
 					continue	
 					}
+				abort := false
+				keyVersionsMu.Lock()
+				for key := range watchedKeys {
+					if watchedKeys[key] != keyVersions[key]{
+						abort = true
+						break
+					}
+				}
+				keyVersionsMu.Unlock()
+				clear(watchedKeys)
+				if abort {
+					inTransaction = false
+					queue = nil
+					response = resp.NullResponse()
+					conn.Write(response)
+					continue}
 				arrayLen := fmt.Sprintf("*%d\r\n", len(queue))
-				response = append(response,[]byte(arrayLen))
+				response = append(response, []byte(arrayLen)...)
 				for i := range queue {
-					response = append(response, writeResponse((queue)[i], false))
+					response = append(response, writeResponse((queue)[i], false)...)
 				}
 				conn.Write(response)
 				inTransaction = false
@@ -155,6 +207,7 @@ func HandleConnection(conn net.Conn) {
 					continue
 					}
 				inTransaction = false
+				clear(watchedKeys)
 				queue = nil
 				response = resp.OkResponse()
 				conn.Write(response)
@@ -214,9 +267,6 @@ func GetCmdSize(chunk string) string {
 }
 
 func writeResponse(cmds []string, isReplay bool) []byte {
-	if len(cmds) == 0 {
-		return resp.ErrorResponse("no command found")
-		}
 	min, op := getMinArgs(cmds[0]) 
 	if err := resp.ErrorMsg(len(cmds), min, cmds[0], op); err != nil {
     		return err
@@ -417,7 +467,7 @@ func getDBSize() int{
 	keys := 0
 	for i := 0; i < NumShards; i++ {
 		shardLocks[i].RLock()
-		for k, _ := range shards[i] {
+		for k := range shards[i] {
            	if isExpired(k,i){
 				continue
 			}
@@ -525,6 +575,7 @@ func HandlePing() []byte {
 		defer shardLocks[index].Unlock()
 		key := cmds[1]
 		val := cmds[2]
+		incKeyVersion(key)
 		shards[index][key] = entry{"string",&val,nil,nil,nil,time.Time{}}
 		logToAOF(cmds,isReplay)
 		return resp.OkResponse()
@@ -549,6 +600,7 @@ func HandlePing() []byte {
         	removeIfExpired(key, index)
 			_, ok := shards[index][key]
 			if ok {
+				incKeyVersion(key)
 				delete(shards[index], key)
 				removedNbr++	
 			}
@@ -576,9 +628,10 @@ func HandlePing() []byte {
 		shardLocks[index].Lock()
 		defer shardLocks[index].Unlock()
 		key := cmds[1]
+		removeIfExpired(key, index)
 		data, ok := shards[index][key]
 		if ok {
-			removeIfExpired(key, index)
+			incKeyVersion(key)
 			exp, err := strconv.Atoi(cmds[2])
 			if err != nil {
 				fmt.Println(err)
@@ -604,7 +657,7 @@ func HandlePing() []byte {
 			if data.expire.IsZero() {
 				return resp.IntResponse(-1)
 			} else {
-				return resp.IntResponse(int(data.expire.Sub(time.Now()).Seconds()))
+				return resp.IntResponse(int(time.Until(data.expire).Seconds()))
 			}
 		} else {
 				return resp.IntResponse(-2)
@@ -617,6 +670,7 @@ func HandlePing() []byte {
 		removeIfExpired(key, index)
 		data, ok := shards[index][key]
 		if ok {
+			incKeyVersion(key)
 			exp, err := strconv.Atoi(cmds[2])
 			if err != nil {
 				fmt.Println(err)
@@ -669,14 +723,14 @@ func HandlePing() []byte {
 		for i:=2; i<len(cmds); i++{
 			newValues = append(newValues,cmds[i])
 				}
+		slices.Reverse(newValues)
 		if ok {
-				if data.kind != "list"{
+			if data.kind != "list"{
 				return resp.ErrorResponse("value not a list")
-			}
-				slices.Reverse(newValues)   
-				*(data.listVal) = append(newValues,*data.listVal...)
+			}   
+			incKeyVersion(key)
+			*(data.listVal) = append(newValues,*data.listVal...)
 		} else {
-				slices.Reverse(newValues)
 				data = entry{"list",nil,&newValues,nil,nil, time.Time{}}
 				shards[index][key] = data
 		}
@@ -695,10 +749,11 @@ func HandlePing() []byte {
 			newValues = append(newValues,cmds[i])
 				}
 		if ok {
-				if data.kind != "list"{
+			if data.kind != "list"{
 				return resp.ErrorResponse("value not a list")
 			}
-				*(data.listVal) = append(*data.listVal,newValues...)
+			incKeyVersion(key)
+			*(data.listVal) = append(*data.listVal,newValues...)
 		} else {
 			data = entry{"list",nil,&newValues,nil,nil, time.Time{}}
 			shards[index][key] = data
@@ -776,6 +831,7 @@ func HandlePing() []byte {
 				if count < 0 {
 				return resp.ErrorResponse("value is not an integer or out of range")}
 				if size == 0 {
+					incKeyVersion(key)
 					delete(shards[index], key)
 					if countProvided {
 						return resp.EmptyArrayResponse()
@@ -788,6 +844,7 @@ func HandlePing() []byte {
 				if count > size  {
 					count = size
 				}
+				incKeyVersion(key)
 				removedVals = (*data.listVal)[:count]
 				(*data.listVal) = (*data.listVal)[count:]
 				logToAOF(cmds,isReplay)
@@ -828,6 +885,7 @@ func HandlePing() []byte {
 				if count < 0 {
 				return resp.ErrorResponse("value is not an integer or out of range")}
 				if size == 0 {
+					incKeyVersion(key)
 					delete(shards[index], key)
 					if countProvided {
 						return resp.EmptyArrayResponse()
@@ -840,6 +898,7 @@ func HandlePing() []byte {
 				if count > size  {
 					count = size
 				}
+				incKeyVersion(key)
 				removedVals = (*data.listVal)[len(*data.listVal)-count:]
 				(*data.listVal) = (*data.listVal)[:len(*data.listVal)-count]
 				logToAOF(cmds,isReplay)
@@ -868,6 +927,7 @@ func HandlePing() []byte {
 				if data.kind != "list"{
 					return resp.ErrorResponse("value not a list")
 				}
+				incKeyVersion(key)
 				slices.Reverse(newValues)   
 				*(data.listVal) = append(newValues,*data.listVal...)
 				shards[index][key] = data
@@ -891,6 +951,7 @@ func HandlePing() []byte {
 				if data.kind != "list"{
 					return resp.ErrorResponse("value not a list")
 				}
+				incKeyVersion(key)
 				*(data.listVal) = append(*data.listVal,newValues...)
 				shards[index][key] = data
 				logToAOF(cmds,isReplay)
@@ -912,6 +973,7 @@ func HandlePing() []byte {
 		if data.kind != "set"{
 			return resp.ErrorResponse("value not a set")
 			}
+		incKeyVersion(key)
 		setlen := 0
 		for i:=2; i<len(cmds);i++{
 		if _, ok := (*data.setVal)[cmds[i]]; !ok{
@@ -991,8 +1053,9 @@ func HandlePing() []byte {
 			return  resp.IntResponse(0)
 		}
 		if data.kind != "set"{
-				return resp.ErrorResponse("value not a set")
+			return resp.ErrorResponse("value not a set")
 				}	
+		incKeyVersion(key)			
 		removedNbr := 0
 		for i:=2; i<len(cmds); i++{
 			_, ok := (*data.setVal)[cmds[i]]
@@ -1021,6 +1084,7 @@ func HandlePing() []byte {
 			if data.kind != "hash"{
 				return resp.ErrorResponse("value not a hash")
 				}
+			incKeyVersion(key)
 			exists := false
 			if _, ok := (*data.hashVal)[field]; ok {
             	exists = true
@@ -1089,7 +1153,9 @@ func HandlePing() []byte {
 			return  resp.IntResponse(0)
 		}
 		if data.kind != "hash"{
-		return resp.ErrorResponse("value not a hash")}
+			return resp.ErrorResponse("value not a hash")
+		}
+		incKeyVersion(key)
 		for i:= 2; i<len(cmds); i++{
 			_, ok := (*data.hashVal)[cmds[i]]
 			if ok {
@@ -1190,6 +1256,7 @@ func HandlePing() []byte {
 		if pos  >= size || pos * -1  > size  {
 			return resp.ErrorResponse("index out of range")
 		}	
+		incKeyVersion(key)
 		if pos  < 0 {
 			pos = size + pos
 		}
@@ -1220,6 +1287,7 @@ func HandlePing() []byte {
 		if data.kind != "list"{
 			return resp.ErrorResponse("value not a list")
 		}
+		incKeyVersion(key)
 		size := len(*data.listVal)
 		if isExpired(key, index) || size == 0 {
 			return resp.OkResponse()
@@ -1245,4 +1313,8 @@ func HandlePing() []byte {
 		return resp.OkResponse()
 	}
 
-	
+func incKeyVersion(key string){
+	keyVersionsMu.Lock()
+	keyVersions[key]++
+	keyVersionsMu.Unlock()
+}
