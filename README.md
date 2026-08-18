@@ -51,7 +51,7 @@ go run main.go
 The server will start on localhost:8080.
 # Starting the Client
 go run client/client.go
-You'll see a prompt:
+# You'll see a prompt:
 redis:8080>
 redis:8080> SET name Alice
 +OK
